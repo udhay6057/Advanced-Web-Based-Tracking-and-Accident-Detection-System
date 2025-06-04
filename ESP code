@@ -1,1 +1,192 @@
+#include <TinyGsmClient.h>
+#include <PubSubClient.h>
+#include <Wire.h>
+#include <MPU6050.h>
+#include <TinyGPS++.h>
+#include <SoftwareSerial.h>
+
+// Adafruit IO MQTT settings
+#define IO_USERNAME  "udhay6057"
+#define IO_KEY       "Your IO key"
+#define AIO_SERVER   "io.adafruit.com"
+#define AIO_PORT     1883
+
+// Feed names
+#define FEED_NAME     "GPS"
+#define SPEED_FEED    "SPEED"
+#define ACCIDENT_FEED "ACCIDENT"
+
+// Pins
+#define RX_PIN        13
+#define TX_PIN        15
+#define SDA_PIN       22
+#define SCL_PIN       21
+#define GSM_RX_PIN    19
+#define GSM_TX_PIN    25
+#define SOS_PIN       18
+
+// GPS
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(1); // Serial1 for GPS
+
+// MPU6050
+MPU6050 mpu;
+
+// GSM
+SoftwareSerial gsmSerial(GSM_RX_PIN, GSM_TX_PIN); // RX, TX for GSM
+#define TINY_GSM_MODEM_SIM800
+TinyGsm modem(gsmSerial);
+TinyGsmClient gsmClient;
+
+// MQTT
+PubSubClient mqtt(gsmClient);
+
+// Emergency
+bool accidentDetected = false;
+String emergencyContact = "+919989097644";
+
+// Connect to GPRS
+void connectGSM() {
+  Serial.println("Initializing modem...");
+  modem.restart();
+
+  Serial.println("Connecting to GSM...");
+  if (!modem.waitForNetwork()) {
+    Serial.println("Network failed");
+    return;
+  }
+
+  if (modem.isNetworkConnected()) {
+    Serial.println("Network connected");
+  }
+
+  Serial.println("Connecting to GPRS...");
+  if (!modem.gprsConnect("airtelgprs.com", "", "")) {  // Replace with your APN
+    Serial.println("GPRS failed");
+    return;
+  }
+  Serial.println("GPRS connected");
+}
+
+// Connect to Adafruit IO
+void connectMQTT() {
+  while (!mqtt.connected()) {
+    Serial.print("Connecting to MQTT...");
+    if (mqtt.connect("ESP32_SIM800_Client", IO_USERNAME, IO_KEY)) {
+      Serial.println("Connected to MQTT!");
+    } else {
+      Serial.print("Failed. Retry in 5s. State=");
+      Serial.println(mqtt.state());
+      delay(5000);
+    }
+  }
+}
+
+// Send SMS
+void sendSMS(String msg) {
+  gsmSerial.println("AT+CMGF=1");
+  delay(300);
+  gsmSerial.println("AT+CMGS=\"" + emergencyContact + "\"");
+  delay(300);
+  gsmSerial.println(msg);
+  delay(300);
+  gsmSerial.write(26);  // CTRL+Z
+  delay(3000);
+  Serial.println("SMS sent: " + msg);
+}
+
+// Publish data
+void publishData(float lat, float lon, float ele) {
+  String topic = String(IO_USERNAME) + "/feeds/" + FEED_NAME + "/json";
+  String payload = "{\"value\":\"GPS\",\"lat\":" + String(lat, 6) + ",\"lon\":" + String(lon, 6) + ",\"ele\":" + String(ele, 2) + "}";
+
+  if (mqtt.publish(topic.c_str(), payload.c_str())) {
+    Serial.println("Published GPS: " + payload);
+  }
+}
+
+void publishSpeed(float speed) {
+  String topic = String(IO_USERNAME) + "/feeds/" + SPEED_FEED;
+  String payload = String(speed);
+  mqtt.publish(topic.c_str(), payload.c_str());
+}
+
+void publishAccidentAlert() {
+  String topic = String(IO_USERNAME) + "/feeds/" + ACCIDENT_FEED;
+  String payload = accidentDetected ? "0" : "1";
+  mqtt.publish(topic.c_str(), payload.c_str());
+}
+
+float calculateAngle(int16_t ax, int16_t ay, int16_t az) {
+  float ax_f = ax / 16384.0;
+  float ay_f = ay / 16384.0;
+  float az_f = az / 16384.0;
+  return atan2(ay_f, az_f) * 180.0 / PI;
+}
+
+void setup() {
+  Serial.begin(115200);
+  gpsSerial.begin(9600, SERIAL_8N1, RX_PIN, TX_PIN);
+  gsmSerial.begin(9600);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  mpu.initialize();
+
+  pinMode(SOS_PIN, INPUT_PULLUP);
+
+  connectGSM();
+
+  mqtt.setServer(AIO_SERVER, AIO_PORT);
+  connectMQTT();
+}
+
+void loop() {
+  if (!mqtt.connected()) {
+    connectMQTT();
+  }
+  mqtt.loop();
+
+  while (gpsSerial.available() > 0) {
+    gps.encode(gpsSerial.read());
+  }
+
+  if (digitalRead(SOS_PIN) == LOW) {
+    Serial.println("SOS Pressed!");
+  }
+
+  if (gps.location.isUpdated()) {
+    float lat = gps.location.lat();
+    float lon = gps.location.lng();
+    float ele = gps.altitude.isValid() ? gps.altitude.meters() : 0;
+
+    publishData(lat, lon, ele);
+    publishSpeed(gps.speed.kmph());
+
+    String mapURL = "https://www.google.com/maps?q=" + String(lat, 6) + "," + String(lon, 6);
+
+    if (digitalRead(SOS_PIN) == LOW) {
+      sendSMS("SOS! Help needed. Location: " + mapURL);
+    }
+  }
+
+  int16_t ax, ay, az;
+  mpu.getAcceleration(&ax, &ay, &az);
+  float angle = calculateAngle(ax, ay, az);
+  Serial.print("Pitch: "); Serial.println(angle);
+
+  if (angle > 15.0 || angle < -15.0) {
+    if (!accidentDetected) {
+      accidentDetected = true;
+      Serial.println("Accident detected!");
+      float lat = gps.location.lat();
+      float lon = gps.location.lng();
+      String mapURL = "https://www.google.com/maps?q=" + String(lat, 6) + "," + String(lon, 6);
+      sendSMS("Accident detected! Location: " + mapURL);
+    }
+  }
+
+  publishAccidentAlert();
+
+  delay(6000);
+}
 
